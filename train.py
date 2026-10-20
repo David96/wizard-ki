@@ -11,7 +11,7 @@ num_games = int(sys.argv[2])
 
 players = []
 for i in range(num_players):
-    players.append(WizardEnv("KI %d" % i, i == 0))
+    players.append(WizardEnv("KI %d" % i, True))
 
 for game in range(num_games):
     threads = []
@@ -24,3 +24,5 @@ for game in range(num_games):
     players[0].send('{"action": "start_game"}')
     for t in threads:
         t.join()
+    for p in players:
+        p.train_agents()

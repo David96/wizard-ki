@@ -125,10 +125,13 @@ class WizardEnv(WizardCallback):
         self.last_announcing_action = None
         self.wrong_move = False
         self.train = train
-        self.agent_playing = QAgent(self.state_size_playing, self.action_size_playing)
-        self.agent_announcing = QAgent(self.state_size_announcing, self.action_size_announcing)
+        self.agent_playing = QAgent(self.state_size_playing, self.action_size_playing, self)
+        self.agent_announcing = QAgent(self.state_size_announcing, self.action_size_announcing, self)
 
     def play_game(self):
+        if self.agent_announcing.epoch > 0:
+            self.agent_playing.update_exploration_probability()
+            self.agent_announcing.update_exploration_probability()
         self.playing_reward = 0
         self.announcing_reward = 0
         self.players = None
@@ -140,23 +143,42 @@ class WizardEnv(WizardCallback):
         for agent in [self.agent_announcing, self.agent_playing]:
             agent.memory_buffer = list()
             agent.load_weights()
+        #self.agent_playing.exploration_proba = 0
+        #self.agent_announcing.exploration_proba = 0
+        self.agent_announcing.gamma = 0
         self.game = WizardGame(self.username, self)
         self.game.start()
 
     def send(self, msg):
         self.game.send(msg)
 
+    def get_valid_playing_actions(self, state):
+        for i in range(9, 29, 2):
+            if state[i] == 0:
+                return list(range(int((i - 9) / 2) + 1))
+        return list(range(20))
+
+    def get_valid_announcing_actions(self, state):
+        return list(range(int(state[0]) + 1))
+
+    def get_valid_actions(self, state):
+        if len(state) == 48:
+            return self.get_valid_announcing_actions(state)
+        else:
+            return self.get_valid_playing_actions(state)
+
     def on_turn(self, ws, state, players):
         enc_state = self.encode_state(state, players)
         if state["announcing"]:
             if self.train and self.last_announcing_state is not None:
-                self.agent_announcing.store_episode(self.last_announcing_state, self.last_announcing_action,
-                        self.announcing_reward, enc_state, False)
+                self.agent_announcing.store_episode(self.last_announcing_state,
+                        self.last_announcing_action, self.announcing_reward, enc_state, False)
             action_space = list(range(state["round"] + 1))
             force_random = False
             if self.wrong_move:
                 force_random = True
             elif self.train and self.last_playing_state is not None:
+                #self.announcing_reward += 1
                 self.agent_playing.store_episode(self.last_playing_state, self.last_playing_action,
                         self.playing_reward, None, True)
                 self.last_playing_state = None
@@ -174,6 +196,7 @@ class WizardEnv(WizardCallback):
             if self.wrong_move:
                 action = self.agent_playing.compute_action(enc_state, action_space, True)
             else:
+                self.playing_reward += 1
                 action = self.agent_playing.compute_action(enc_state, action_space)
             card = state["hand"][action]
             ws.send(json.dumps({"action":"play_card", **card}))
@@ -189,43 +212,52 @@ class WizardEnv(WizardCallback):
     def on_state_update(self, ws, state):
         self.state = state
         if state["game_over"]:
-            if self.train:
-                self.agent_playing.store_episode(self.last_playing_state, self.last_playing_action,
-                        self.playing_reward, None, True)
-                self.agent_announcing.store_episode(self.last_announcing_state, self.last_announcing_action,
-                        self.announcing_reward, None, True)
-                self.agent_playing.train()
-                self.agent_announcing.train()
-            self.agent_playing.update_exploration_probability()
-            self.agent_announcing.update_exploration_probability()
             ws.close()
+
+    def train_agents(self):
+        self.agent_playing.store_episode(self.last_playing_state, self.last_playing_action,
+                self.playing_reward, None, True)
+        self.agent_announcing.store_episode(self.last_announcing_state, self.last_announcing_action,
+                self.announcing_reward, None, True)
+        self.agent_playing.train()
+        self.agent_announcing.train()
+
 
     def on_player_update(self, ws, players):
         if self.players:
             old_player = self.get_player(self.players)
             new_player = self.get_player(players)
             if old_player["tricks"] != new_player["tricks"]:
-                self.playing_reward += -10 if new_player["tricks"] > new_player["announcement"] else 5
+                self.playing_reward += -1 if new_player["tricks"] > new_player["announcement"] else 5
                 if new_player["tricks"] == new_player["announcement"]:
-                    self.playing_reward += 15
+                    self.playing_reward += 5
             if old_player["score"] != new_player["score"]:
-                self.announcing_reward += new_player["score"] - old_player["score"]
+                self.announcing_reward -= abs(new_player["tricks"] - new_player["announcement"]) * 10
+                if new_player["score"] > old_player["score"]:
+                    self.playing_reward += 10
         self.players = players
 
     def on_error(self, ws, msg):
         if msg != 'It\'s not your turn, bitch':
-            if msg != 'Nope. Wrong number ¯\\_(ツ)_/¯':
-                self.playing_reward -= 10
-            else:
-                self.announcing_reward -= 10
+            #if msg != 'Nope. Wrong number ¯\\_(ツ)_/¯':
+            #    self.playing_reward -= 1
+            #else:
+            #    self.announcing_reward -= 1
             self.wrong_move = True
 
     def encode_state(self, state, players):
         encoded_state = np.zeros(self.state_size_announcing if state["announcing"] else self.state_size_playing)
         encoded_state[0] = state["round"]
         encoded_state[1] = len(players)
-        for (i, p) in enumerate(players):
-            encoded_state[i + 2] = p["announcement"]
+        cur_player = self.get_player(players)
+
+        # always list currents player announcement first
+        encoded_state[2] = cur_player["announcement"] - cur_player["tricks"]
+        i = 0
+        for p in players:
+            if p["name"] != self.username:
+                encoded_state[i + 3] = p["announcement"] - p["tricks"]
+                i += 1
         for (i, c) in enumerate(state["hand"]):
             nr, color = self.encode_card(c, state["trump"])
             encoded_state[3 + 6 + 2*i] = nr

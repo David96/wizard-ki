@@ -8,7 +8,7 @@ from tensorflow.keras import Sequential
 from tensorflow.keras.layers import Dense
 from tensorflow.keras.optimizers import Adam
 
-checkpoint_dir = "training_2/"
+checkpoint_dir = "training_8/"
 #checkpoint_dir = os.path.dirname(checkpoint_path)
 #cp_callback = tf.keras.callbacks.ModelCheckpoint(filepath=checkpoint_path,
 #        save_weights_only=True,
@@ -16,12 +16,13 @@ checkpoint_dir = "training_2/"
 
 class QAgent:
 
-    def __init__(self, state_size, action_size):
+    def __init__(self, state_size, action_size, env):
+        self.env = env
         self.n_actions = action_size
         self.lr = 0.001
         self.gamma = 0.99
-        self.exploration_proba = 0.6
-        self.exploration_proba_decay = 0.05
+        self.exploration_proba = 0.1
+        self.exploration_proba_decay = 0.01
         self.batch_size = 32
         self.epoch = 0
 
@@ -47,10 +48,7 @@ class QAgent:
         sorted_q = (-q_values).argsort()
         print("q_values: %s" % q_values)
         print("Sorted actions: %s" % sorted_q)
-        for action in sorted_q:
-            if int(action) in allowed_actions:
-                print("Found valid action: %d" % int(action))
-                return int(action)
+        return self.get_first_allowed_action(sorted_q, allowed_actions)
         return 0
 
     def update_exploration_probability(self):
@@ -67,8 +65,15 @@ class QAgent:
         if len(self.memory_buffer) > self.max_memory_buffer:
             self.memory_buffer.pop(0)
 
+    def get_first_allowed_action(self, sorted_q, allowed_actions):
+        for action in sorted_q:
+            if int(action) in allowed_actions:
+                return int(action)
+
     def train(self):
+        self.load_weights()
         np.random.shuffle(self.memory_buffer)
+        #sample = self.memory_buffer[0:min(len(self.memory_buffer) - 1, 64)]
 
         for exp in self.memory_buffer:
             current_state = exp["current_state"].reshape(1, -1)
@@ -76,8 +81,11 @@ class QAgent:
             q_target = exp["reward"]
             if not exp["done"]:
                 next_state = exp["next_state"].reshape(1, -1)
-                q_target = q_target + self.gamma *\
-                    np.max(self.model.predict(next_state)[0])
+                state_prediction = (-self.model.predict(next_state)[0]).argsort()
+                action_prediction = self.get_first_allowed_action(state_prediction,
+                        self.env.get_valid_actions(next_state[0]))
+                q_target = q_target + self.gamma * state_prediction[action_prediction]
+
             q_current_state[0][exp["action"]] = q_target
             self.model.fit(current_state, q_current_state, initial_epoch=self.epoch,
                     verbose=1, epochs=self.epoch + 1)
