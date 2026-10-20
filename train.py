@@ -20,6 +20,7 @@ for game in range(num_games):
         threads.append(t)
         t.start()
         time.sleep(0.5)
+    time.sleep(5)
     print("Started game %d" % game)
     players[0].send('{"action": "start_game"}')
     for t in threads:

@@ -76,6 +76,13 @@ class WizardGame:
         print("Forever is over")
 
 
+def _alloc(spec):
+    offs, cur = {}, 0
+    for name, size in spec:
+        offs[name] = cur
+        cur += size
+    return offs, cur
+
 class WizardEnv(WizardCallback):
     '''
     state layout playing:
@@ -108,12 +115,20 @@ class WizardEnv(WizardCallback):
         1st int: strength: 1-13 for normal card, 14-26 for trump, 27 wizard, 1 fool
         2nd int: color: 1-4 for normal colors, 0 for fool and wizard
     '''
+
+    NUM_CARDS = 60
+    OFFSETS, OBS_DIM = _alloc([
+        ("round", 1), ("phase", 2), ("players", 1), ("trump", 5), ("lead", 6),
+        ("tricks_won", 6), ("tricks_needed", 6),
+        ("hand", NUM_CARDS), ("played", NUM_CARDS), ("table", NUM_CARDS),
+        ("trump_card", NUM_CARDS), ("unseen", NUM_CARDS),
+    ])
+
     def __init__(self, username, train):
-        self.state_size_playing = 60
-        self.action_size_playing = 20
-        self.state_size_announcing = 48
+        self.state_size_playing = self.OBS_DIM
+        self.action_size_playing = self.NUM_CARDS
+        self.state_size_announcing = self.OBS_DIM
         self.action_size_announcing = 21
-        self.player_count = 6
         self.username = username
         self.playing_reward = 0
         self.announcing_reward = 0
@@ -247,50 +262,61 @@ class WizardEnv(WizardCallback):
 
     def encode_state(self, state, players):
         encoded_state = np.zeros(self.state_size_announcing if state["announcing"] else self.state_size_playing)
-        encoded_state[0] = state["round"]
-        encoded_state[1] = len(players)
-        cur_player = self.get_player(players)
+        encoded_state[self.OFFSETS["round"]] = state["round"]
+        encoded_state[self.OFFSETS["players"]] = len(players)
+        encoded_state[self.OFFSETS["phase"] + (1 if state["announcing"] else 0)] = 1.0
 
-        # always list currents player announcement first
-        encoded_state[2] = cur_player["announcement"] - cur_player["tricks"]
-        i = 0
-        for p in players:
-            if p["name"] != self.username:
-                encoded_state[i + 3] = p["announcement"] - p["tricks"]
-                i += 1
-        for (i, c) in enumerate(state["hand"]):
-            nr, color = self.encode_card(c, state["trump"])
-            encoded_state[3 + 6 + 2*i] = nr
-            encoded_state[3 + 6 + 2*i + 1] = color
+        trump = state["trump"]
+        if trump is None or trump["type"] == "fool":
+            encoded_state[self.OFFSETS["trump"] + 4] = 1.0
+        else:
+            encoded_state[self.OFFSETS["trump"] + self.stc(trump["color"])] = 1.0
+
+        lead = state["table"][0]
+        if lead["type"] == "wizard":
+            encoded_state[self.OFFSETS["lead"] + 4] = 1.0
+        elif lead["type"] == "fool":
+            encoded_state[self.OFFSETS["lead"] + 5] = 1.0
+        else:
+            encoded_state[self.OFFSETS["lead"] + self.stc(lead)] = 1.0
+
+        i, _ = self.get_player(players)
+        rel_players = np.roll(players, -i)
+
+        for (i, p) in enumerate(rel_players):
+            encoded_state[self.OFFSETS["tricks_won"] + i] = p["tricks"]
+            encoded_state[self.OFFSETS["tricks_needed"] + i] = p["announcement"] - p["tricks"]
+
+        encoded_state[self.OFFSETS["hand"]:self.OFFSETS["hand"] + self.NUM_CARDS] = \
+            self.encode_cards(state["hand"])
         if not state["announcing"]:
-            for (i, c) in enumerate(state["table"]):
-                nr, color = self.encode_card(c, state["trump"])
-                encoded_state[3 + 6 + 20 + 2*i] = nr
-                encoded_state[3 + 6 + 20 + 2*i + 1] = color
+            encoded_state[self.OFFSETS["table"]:self.OFFSETS["table"] + self.NUM_CARDS] = \
+                self.encode_cards(state["table"])
+        encoded_state[self.OFFSETS["trump_card"]:self.OFFSETS["trump_card"] + self.NUM_CARDS] = \
+            self.encode_cards([state["trump"]])
         return encoded_state
 
-    def get_player(self, players):
-        for p in players:
+    def get_player(self, players) -> tuple[int, dict]:
+        for (i, p) in enumerate(players):
             if p["name"] == self.username:
-                return p
-        return None
+                return i, p
+        raise Exception("done fucked up, user doesn't exist")
 
-    def encode_card(self, c, trump):
-        if c["type"] == "wizard":
-            nr = 27
-            color = 0
-        elif c["type"] == "fool":
-            nr = 1
-            color = 0
-        elif c["type"] == "number":
-            nr = c["number"]
-            if trump and trump["type"] == "number" and c["color"] == trump["color"]:
-                nr += 13
-            color = self.stc(c["color"])
-        return (nr, color)
-
+    def encode_cards(self, cards):
+        deck = np.zeros(self.NUM_CARDS)
+        n_wizard = n_fool = 0
+        for c in cards:
+            if c["type"] == "number":
+                 deck[13 * self.stc(c["color"]) + c["number"] - 1] = 1.0
+            elif c["type"] == "wizard":
+                deck[13 * 4 + n_wizard] = 1.0
+                n_wizard += 1
+            elif c["type"] == "fool":
+                deck[13 * 4 + 4 + n_fool] = 1.0
+                n_fool += 1
+        return deck
 
     def stc(self, color):
-        colors = ['red', 'blue', 'green', 'yellow', 'orange']
-        return colors.index(color) + 1
+        colors = ['red', 'blue', 'green', 'yellow']
+        return colors.index(color)
 

@@ -8,7 +8,7 @@ from tensorflow.keras import Sequential
 from tensorflow.keras.layers import Dense
 from tensorflow.keras.optimizers import Adam
 
-checkpoint_dir = "training_8/"
+checkpoint_dir = "training_9/"
 #checkpoint_dir = os.path.dirname(checkpoint_path)
 #cp_callback = tf.keras.callbacks.ModelCheckpoint(filepath=checkpoint_path,
 #        save_weights_only=True,
@@ -30,11 +30,12 @@ class QAgent:
         self.max_memory_buffer = 2000
 
         self.model = Sequential([
-                Dense(units=24, input_dim=state_size, activation="relu"),
-                Dense(units=24, activation="relu"),
+                Dense(units=state_size, activation="relu"),
+                Dense(units=512, activation="relu"),
+                Dense(units=512, activation="relu"),
                 Dense(units=action_size, activation="linear")
             ])
-        self.model.compile(loss="mse", optimizer=Adam(lr=self.lr))
+        self.model.compile(loss="mse", optimizer=Adam(learning_rate=self.lr))
 
     def load_weights(self):
         if os.path.isfile(checkpoint_dir + str(self.n_actions) + ".tf.index"):
