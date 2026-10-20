@@ -5,7 +5,7 @@ import os.path
 
 from tensorflow import keras
 from tensorflow.keras import Sequential
-from tensorflow.keras.layers import Dense
+from tensorflow.keras.layers import Dense, Input
 from tensorflow.keras.optimizers import Adam
 
 checkpoint_dir = "training_9/"
@@ -16,9 +16,10 @@ checkpoint_dir = "training_9/"
 
 class QAgent:
 
-    def __init__(self, state_size, action_size, env):
+    def __init__(self, state_size, action_output_size, bidding_output_size env):
         self.env = env
-        self.n_actions = action_size
+        self.n_output_action= action_output_size
+        self.n_output_bidding= bidding_output_size
         self.lr = 0.001
         self.gamma = 0.99
         self.exploration_proba = 0.1
@@ -29,12 +30,13 @@ class QAgent:
         self.memory_buffer = list()
         self.max_memory_buffer = 2000
 
-        self.model = Sequential([
-                Dense(units=state_size, activation="relu"),
-                Dense(units=512, activation="relu"),
-                Dense(units=512, activation="relu"),
-                Dense(units=action_size, activation="linear")
+        self.encoder= Sequential([
+                Input(state_size),
+                Dense(512, activation="relu"),
+                Dense(512, activation="relu"),
             ])
+        self.action_head = Dense(action_output_size)
+        self.bidding_head = Dense(bidding_output_size)
         self.model.compile(loss="mse", optimizer=Adam(learning_rate=self.lr))
 
     def load_weights(self):
@@ -50,7 +52,6 @@ class QAgent:
         print("q_values: %s" % q_values)
         print("Sorted actions: %s" % sorted_q)
         return self.get_first_allowed_action(sorted_q, allowed_actions)
-        return 0
 
     def update_exploration_probability(self):
         self.exploration_proba = self.exploration_proba * np.exp(-self.exploration_proba_decay)
