@@ -1,29 +1,48 @@
-from environment import WizardEnv
+"""Run shared-policy self-play against the local Wizard websocket server.
+
+Usage: python train.py NUM_PLAYERS NUM_GAMES
+The game server must be running on ws://localhost:6791.
+"""
 import sys
-from threading import Thread
 import time
+from threading import Thread
 
-if len(sys.argv) != 3:
-    print("wrong number of args")
+from environment import WizardEnv
+from q_agent import QAgent
 
-num_players = int(sys.argv[1])
-num_games = int(sys.argv[2])
 
-players = []
-for i in range(num_players):
-    players.append(WizardEnv("KI %d" % i, True))
+def main(num_players, num_games):
+    state_size = WizardEnv.OBS_DIM
+    shared_agent = QAgent(state_size)
+    shared_agent.load_weights()
 
-for game in range(num_games):
-    threads = []
-    for p in players:
-        t = Thread(target=p.play_game)
-        threads.append(t)
-        t.start()
-        time.sleep(0.5)
-    time.sleep(5)
-    print("Started game %d" % game)
-    players[0].send('{"action": "start_game"}')
-    for t in threads:
-        t.join()
-    for p in players:
-        p.train_agents()
+    players = [
+        WizardEnv(f"KI {i}", train=True, shared_agent=shared_agent)
+        for i in range(num_players)
+    ]
+
+    for game_idx in range(num_games):
+        threads = []
+        for player in players:
+            thread = Thread(target=player.play_game, args=(game_idx,), daemon=True)
+            thread.start()
+            threads.append(thread)
+            time.sleep(0.1)
+
+        # Keep the original server protocol: start after clients have joined.
+        time.sleep(1.0)
+        players[0].send('{"action": "start_game"}')
+        for thread in threads:
+            thread.join()
+
+        # Every player has contributed to one shared rollout; update once.
+        shared_agent.train()
+        print(f"Finished game {game_idx + 1}/{num_games}")
+
+    print("Training complete.")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 3:
+        raise SystemExit("Usage: python train.py NUM_PLAYERS NUM_GAMES")
+    main(int(sys.argv[1]), int(sys.argv[2]))
