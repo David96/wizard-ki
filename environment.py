@@ -6,6 +6,7 @@ import numpy as np
 import sys
 import traceback
 
+from actor_critic import ActorCriticAgent
 from q_agent import QAgent
 
 
@@ -89,15 +90,17 @@ class WizardEnv(WizardCallback):
     # All observations have the same fixed length in both phases.
     OFFSETS, OBS_DIM = _alloc([
         ("round", 1), ("phase", 2), ("players", 1),
-        ("trump", 5), ("lead", 6),
-        ("tricks_won", 6), ("tricks_needed", 6), ("scores", 6), ("cards_to_play", 1),
+        ("trump", 5), ("lead", 6), ("has_bid", 6), ("tricks_won", 6),
+        ("tricks_needed", 6), ("scores", 6), ("cards_to_play", 1),
+        ("n_wizards", 1), ("n_fools", 1), ("n_trump", 1),
         ("hand", NUM_CARDS), ("played", NUM_CARDS), ("table", NUM_CARDS), ("unseen", NUM_CARDS),
     ])
 
-    def __init__(self, username, train=True, shared_agent=None, websocket_url="ws://localhost:6791"):
+    def __init__(self, username, train, shared_agent : ActorCriticAgent,
+                 websocket_url="ws://localhost:6791"):
         self.username = username
         self.train = bool(train)
-        self.agent = shared_agent or QAgent(self.OBS_DIM, env=self)
+        self.agent = shared_agent
         self.websocket_url = websocket_url
         self.players = None
         self.state = None
@@ -106,17 +109,17 @@ class WizardEnv(WizardCallback):
         self.announcing_reward = 0.0
         self.last_playing_state = None
         self.last_playing_action = None
+        self.last_playing_legal = None
         self.last_announcing_state = None
         self.last_announcing_action = None
-        self.game_index = 0
+        self.last_announcing_legal = None
         self.previous_players = None
         self._lock = threading.RLock()
         self.game = None
 
-    def play_game(self, game_index=None):
-        if game_index is not None:
-            self.game_index = int(game_index)
+    def play_game(self):
         self.correct_rounds = 0
+        self.bid_diffs = []
         self.playing_reward = 0.0
         self.announcing_reward = 0.0
         self.players = None
@@ -125,6 +128,7 @@ class WizardEnv(WizardCallback):
         self.previous_players = None
         self.last_playing_state = self.last_playing_action = None
         self.last_announcing_state = self.last_announcing_action = None
+        self.last_playing_legal = self.last_announcing_legal = None
         self.game = WizardGame(self.username, self, self.websocket_url)
         self.game.start()
 
@@ -148,17 +152,19 @@ class WizardEnv(WizardCallback):
         if phase == "play" and self.last_playing_state is not None:
             self.agent.store_episode(
                 self.last_playing_state, self.last_playing_action,
-                self.playing_reward, next_state, done, phase="play",
-                actor_id=self.actor_id, episode_id=self.game_index)
-            self.last_playing_state = self.last_playing_action = None
-            self.playing_reward = 0.0
+                self.last_playing_legal,
+                self.playing_reward, next_state, done, "play",
+                self.actor_id, log_prob=self.last_playing_logp)
+            self.last_playing_state = self.last_playing_action = self.last_playing_legal =  None
+            self.playing_reward = self.last_playing_logp = 0.0
         elif phase == "bid" and self.last_announcing_state is not None:
             self.agent.store_episode(
                 self.last_announcing_state, self.last_announcing_action,
-                self.announcing_reward, next_state, done, phase="bid",
-                actor_id=self.actor_id, episode_id=self.game_index)
-            self.last_announcing_state = self.last_announcing_action = None
-            self.announcing_reward = 0.0
+                self.last_announcing_legal,
+                self.announcing_reward, next_state, done, "bid",
+                self.actor_id, log_prob=self.last_bidding_logp)
+            self.last_announcing_state = self.last_announcing_action = self.last_announcing_legal = None
+            self.announcing_reward = self.last_bidding_logp = 0.0
 
     def get_valid_announcing_actions(self, state, players):
         # state["round"] is the number of cards dealt this round; bids are 0..round.
@@ -172,7 +178,7 @@ class WizardEnv(WizardCallback):
             announcements.remove(-1)
             illegal = state["round"] - sum(announcements)
             if illegal >= 0:
-                print(f"Round {state["round"]}, legal {legal}, illegal {illegal}")
+                #print(f"Round {state["round"]}, legal {legal}, illegal {illegal}")
                 legal.remove(illegal)
         return legal
 
@@ -221,21 +227,21 @@ class WizardEnv(WizardCallback):
             if self.last_announcing_state is not None:
                 self._finish_pending("bid", enc_state, False)
             legal = self.get_valid_announcing_actions(state, players)
-            action = self.agent.compute_action(
-                enc_state, legal,
-                phase="bid", actor_id=self.actor_id)
+            action, self.last_bidding_logp, _ = self.agent.compute_action(
+                enc_state, legal, phase="bid")
             ws.send(json.dumps({"action": "announce", "announcement": action}))
             self.last_announcing_state, self.last_announcing_action = enc_state.copy(), action
+            self.last_announcing_legal = legal
         else:
             if self.last_playing_state is not None:
                 self._finish_pending("play", enc_state, False)
             legal = self.get_valid_playing_actions(state)
-            action = self.agent.compute_action(
-                enc_state, legal,
-                phase="play", actor_id=self.actor_id)
+            action, self.last_playing_logp, _ = self.agent.compute_action(
+                enc_state, legal, phase="play")
             card = self._card_for_action(state["hand"], action)
             ws.send(json.dumps({"action": "play_card", **card}))
             self.last_playing_state, self.last_playing_action = enc_state.copy(), action
+            self.last_playing_legal = legal
 
     def on_choosing_trump(self, ws, state, players):
         # Keep this deterministic baseline behavior; trump choice is not yet an
@@ -245,11 +251,21 @@ class WizardEnv(WizardCallback):
 
     def on_state_update(self, ws, state):
         self.state = state
+        encoded_table =  self.encode_cards(state["table"])
+        self.played |= np.astype(encoded_table, bool)
         if state.get("game_over"):
             # Finalize any outstanding sampled action as terminal.
             self._finish_pending("play", None, True)
             self._finish_pending("bid", None, True)
-            print(f"Game finished with scores {[p["score"] for p in self.players]}, correct bids: {self.correct_rounds}")
+            _, me = self.get_player(self.players)
+            print(f"Game finished with score {me["score"]}, "
+                  f"correct bids: {self.correct_rounds}\n"
+                  f"\tbid_diffs: {self.bid_diffs}\n"
+                  f"\tavg: {np.mean(self.bid_diffs)}")
+            with self.agent.lock:
+                with open("game_data.txt", "ab") as f:
+                    np.savetxt(f, self.bid_diffs, fmt="%.5f", delimiter=' ', newline=', ')
+                    f.write(b'\n')
             ws.close()
 
     def on_player_update(self, ws, players):
@@ -259,15 +275,18 @@ class WizardEnv(WizardCallback):
             if old.get("tricks") != new.get("tricks"):
                 # Dense, small shaping reward; exact round score is also
                 # assigned to the bid decision below.
-                self.playing_reward += -10.0 if new["tricks"] > new["announcement"] else 10.0
+                self.playing_reward += -1.0 if new["tricks"] > new["announcement"] else 1.0
                 #if new["tricks"] == new["announcement"]:
                 #    self.playing_reward += 5.0
             if old.get("score") != new.get("score"):
+                score_diff = new["score"] - old["score"]
+                bid_diff = (score_diff - 20) / 10 if score_diff > 0 else score_diff / 10
                 # Higher rounds score higher, therefore normalize to the round number
-                self.announcing_reward += (new["score"] - old["score"])# / self.state["round"]
+                self.announcing_reward += (score_diff) / 10 / self.state["round"]
                 # Don't penalize playing head to strongly in case of a bad bid
-                self.playing_reward += 10.0 if new["score"] > old["score"] else -10.0
+                self.playing_reward += 5.0 if new["score"] > old["score"] else -5.0
                 self.correct_rounds += 1 if new["score"] > old["score"] else 0
+                self.bid_diffs.append(bid_diff)
         self.previous_players = [dict(p) for p in players]
         self.players = players
 
@@ -311,18 +330,23 @@ class WizardEnv(WizardCallback):
         actor_index, _ = self.get_player(players)
         relative_players = list(players[actor_index:]) + list(players[:actor_index])
         for i, p in enumerate(relative_players):
-            encoded[off["scores"] + i] = p["score"]
+            encoded[off["scores"] + i] = p["score"] / 500 # keep around O(1)
             encoded[off["tricks_won"] + i] = p["tricks"] / state["round"]
             announced = p["announcement"]
             if announced != -1:
+                encoded[off["has_bid"] + i] = 1.0
                 encoded[off["tricks_needed"] + i] = (announced - p["tricks"]) / state["round"]
 
         encoded_hand = self.encode_cards(state["hand"])
         encoded_table =  self.encode_cards(table)
+        encoded[off["n_wizards"]] = sum(c["type"] == "wizard" for c in state["hand"]) / 4
+        encoded[off["n_fools"]] = sum(c["type"] == "fool" for c in state["hand"]) / 4
+        if lead and "color" in lead and state["hand"]:
+            encoded[off["n_trump"]] = sum("color" in c and c["color"] == lead["color"]
+                                         for c in state["hand"]) / len(state["hand"])
         encoded[off["hand"]:off["hand"] + self.NUM_CARDS] = encoded_hand
         encoded[off["table"]:off["table"] + self.NUM_CARDS] = encoded_table
 
-        self.played |= np.astype(encoded_table, bool)
         if trump:
             self.played[self._card_action_id(trump)] = True
 
