@@ -154,7 +154,8 @@ class WizardEnv(WizardCallback):
                 self.last_playing_state, self.last_playing_action,
                 self.last_playing_legal,
                 self.playing_reward, next_state, done, "play",
-                self.actor_id, log_prob=self.last_playing_logp)
+                self.actor_id, self.last_playing_logp,
+                self.last_playing_value)
             self.last_playing_state = self.last_playing_action = self.last_playing_legal =  None
             self.playing_reward = self.last_playing_logp = 0.0
         elif phase == "bid" and self.last_announcing_state is not None:
@@ -162,7 +163,8 @@ class WizardEnv(WizardCallback):
                 self.last_announcing_state, self.last_announcing_action,
                 self.last_announcing_legal,
                 self.announcing_reward, next_state, done, "bid",
-                self.actor_id, log_prob=self.last_bidding_logp)
+                self.actor_id, self.last_bidding_logp,
+                self.last_bidding_value)
             self.last_announcing_state = self.last_announcing_action = self.last_announcing_legal = None
             self.announcing_reward = self.last_bidding_logp = 0.0
 
@@ -186,9 +188,6 @@ class WizardEnv(WizardCallback):
         return card["id"]
 
     def get_valid_playing_actions(self, state):
-        # Build the same stable card IDs used by encode_cards(hand), then map the
-        # selected ID back to a card object in on_turn. Number cards are unique;
-        # Wizard/Fool occurrences are indexed in their order within the hand.
         legal = []
         i = 0
         lead = None
@@ -227,7 +226,7 @@ class WizardEnv(WizardCallback):
             if self.last_announcing_state is not None:
                 self._finish_pending("bid", enc_state, False)
             legal = self.get_valid_announcing_actions(state, players)
-            action, self.last_bidding_logp, _ = self.agent.compute_action(
+            action, self.last_bidding_logp, self.last_bidding_value = self.agent.compute_action(
                 enc_state, legal, phase="bid")
             ws.send(json.dumps({"action": "announce", "announcement": action}))
             self.last_announcing_state, self.last_announcing_action = enc_state.copy(), action
@@ -236,7 +235,7 @@ class WizardEnv(WizardCallback):
             if self.last_playing_state is not None:
                 self._finish_pending("play", enc_state, False)
             legal = self.get_valid_playing_actions(state)
-            action, self.last_playing_logp, _ = self.agent.compute_action(
+            action, self.last_playing_logp, self.last_playing_value = self.agent.compute_action(
                 enc_state, legal, phase="play")
             card = self._card_for_action(state["hand"], action)
             ws.send(json.dumps({"action": "play_card", **card}))

@@ -20,7 +20,8 @@ class ActorCriticAgent:
         self.state_size = state_size
         self.lock = Lock()
         self.lr = 3e-4
-        self.gamma = 1.0
+        self.gamma = 0.99
+        self.gae_λ = 0.95
         self.max_grad_norm = 0.8
         self.ent_coef = 0.02
         self.phase_weight = {"play": 0.5, "bid": 0.5}
@@ -72,7 +73,7 @@ class ActorCriticAgent:
         return action, log_prob, float(value[0, 0])
 
     def store_episode(self, current_state, action, legal, reward, next_state, done,
-                      phase, actor_id, log_prob=None, value=None):
+                      phase, actor_id, log_prob, value):
         with self.lock:
             if not actor_id in self.memory_buffers:
                 self.memory_buffers[actor_id] = {"bid": deque(), "play": deque()}
@@ -92,9 +93,23 @@ class ActorCriticAgent:
         entropy = -tf.reduce_sum(tf.exp(log_probs_all) * log_probs_all, axis=-1)
         return log_prob, tf.squeeze(values, -1), entropy
 
+    def compute_gae(self, events):
+        """One episode in time order. Returns (advantages, critic targets), both on the scaled reward."""
+        values = np.array([e["value"] for e in events], np.float32)
+        rewards = np.array([e["reward"] for e in events], np.float32)
+        next_values = np.append(values[1:], 0.0)  # value after the terminal step is 0
+        deltas = rewards + self.gamma * next_values - values
+        adv = np.zeros_like(deltas)
+        last = 0.0
+        for t in reversed(range(len(deltas))):
+            last = deltas[t] + self.gamma * self.gae_λ * last
+            adv[t] = last
+        return adv, adv + values   # critic target = advantage + old value
+
     def _create_batch(self, rewards):
         # Create batch for a single model update pass
-        batch = {phase: {"state": [], "legal": [], "action": [], "ret": [], "old_logp": []}
+        batch = {phase: {"state": [], "legal": [], "action": [], "adv": [],
+                         "ret": [], "old_logp": []}
                      for phase in ("bid", "play")}
         for actor_history in self.memory_buffers.values():
             for phase, data in actor_history.items():
@@ -115,13 +130,15 @@ class ActorCriticAgent:
                         discounted_sum = e["reward"] + self.gamma * discounted_sum
                         returns.insert(0, discounted_sum)
 
+                    adv, ret = self.compute_gae(events)
                     b = batch[phase]
-                    for e, ret in zip(events, returns):
+                    for e, a, r in zip(events, adv, ret):
                         b["state"].append(e["state"])
                         b["legal"].append(self._legal_mask(e["legal_actions"], phase))
                         b["action"].append(e["action"])
-                        b["ret"].append(ret)
-                        b["old_logp"].append(e.get("log_prob"))
+                        b["adv"].append(a)
+                        b["ret"].append(r)
+                        b["old_logp"].append(e["log_prob"])
         return batch
 
     def train(self):
@@ -136,6 +153,9 @@ class ActorCriticAgent:
                 masks = tf.convert_to_tensor(np.array(b["legal"], dtype=bool))
                 actions = tf.convert_to_tensor(b["action"], tf.int32)
                 ret = tf.convert_to_tensor(b["ret"], tf.float32)
+                adv = np.array(b["adv"], np.float32)
+                adv_norm = (adv - adv.mean()) / (adv.std() + eps)
+                adv_norm = tf.convert_to_tensor(adv_norm, tf.float32)
 
                 log_prob, value, entropy = self.evaluate_actions(states, masks, actions, phase)
 
@@ -145,22 +165,8 @@ class ActorCriticAgent:
                                                                               np.float32))))
                     if max_diff > 1e-4:
                         print(f"Warning: stored vs recomputed log_prob differ by {max_diff} ({phase})")
-
-                # At this point in history, the critic estimated that we would get
-                # a total reward = `value` in the future. We took an action with
-                # log probability of `log_prob` and ended up receiving a total
-                # reward = `ret`. The actor must be updated so that it predicts an
-                # action that leads to high rewards (compared to critic's estimate)
-                # with high probability.
-                diff = tf.stop_gradient(ret - value)  # advantage must not train the critic
-                diff = (diff - tf.reduce_mean(diff)) / \
-                    (tf.math.reduce_std(diff) + eps)
-                actor_loss = -tf.reduce_mean(log_prob * diff)
-
-                # The critic must be updated so that it predicts a better estimate of
-                # the future rewards.
+                actor_loss = -tf.reduce_mean(log_prob * adv_norm)
                 critic_loss = tf.reduce_mean(self.loss(ret[:, None], value[:, None]))
-
                 loss_value = self.phase_weight[phase] * (
                     actor_loss + 0.5 * critic_loss - self.ent_coef * tf.reduce_mean(entropy))
 
