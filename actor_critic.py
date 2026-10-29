@@ -18,20 +18,21 @@ class ActorCriticAgent:
     def __init__(self, state_size: int,
                  checkpoint_path: str = "training_actor_critic/shared_policy.weights.h5"):
         self.state_size = state_size
+        self.phase1 = True
         self.lock = Lock()
         self.lr = 3e-4
         self.gamma = 0.99
         self.gae_λ = 0.95
         self.max_grad_norm = 0.8
         self.ent_coef = 0.02
-        self.phase_weight = {"play": 0.5, "bid": 0.5}
+        self.phase_weight = {"play": 0.7, "bid": 0.3}
         self.epoch = 0
         self.memory_buffers = {}
         self.checkpoint_path = checkpoint_path
         os.makedirs(os.path.dirname(checkpoint_path) or ".", exist_ok=True)
 
         state_in = keras.Input(shape=(self.state_size,), dtype=tf.float32, name="state")
-        x = layers.Dense(256, activation="relu", name="shared_dense_1")(state_in)
+        x = layers.Dense(512, activation="relu", name="shared_dense_1")(state_in)
         x = layers.Dense(256, activation="relu", name="shared_dense_2")(x)
         play_logits = layers.Dense(self.NUM_PLAY_ACTIONS,
                                    name="play_logits")(x)
@@ -109,7 +110,7 @@ class ActorCriticAgent:
     def _create_batch(self, rewards):
         # Create batch for a single model update pass
         batch = {phase: {"state": [], "legal": [], "action": [], "adv": [],
-                         "ret": [], "old_logp": []}
+                         "rewards": [], "ret": [], "old_logp": []}
                      for phase in ("bid", "play")}
         for actor_history in self.memory_buffers.values():
             for phase, data in actor_history.items():
@@ -118,6 +119,7 @@ class ActorCriticAgent:
                     events = []
                     while not (event := data.popleft())["done"]:
                         events.append(event)
+                    events.append(event)
                     rewards[phase].append(sum(e["reward"] for e in events))
 
                     # Calculate expected value from rewards
@@ -138,12 +140,14 @@ class ActorCriticAgent:
                         b["action"].append(e["action"])
                         b["adv"].append(a)
                         b["ret"].append(r)
+                        b["rewards"].append(e["reward"])
                         b["old_logp"].append(e["log_prob"])
         return batch
 
     def train(self):
         rewards = {"bid": [], "play": []}
-        total_actor_losses = []
+        total_player_losses = []
+        total_bids_losses = []
         total_critic_losses = []
 
         total_loss = None
@@ -156,6 +160,16 @@ class ActorCriticAgent:
                 adv = np.array(b["adv"], np.float32)
                 adv_norm = (adv - adv.mean()) / (adv.std() + eps)
                 adv_norm = tf.convert_to_tensor(adv_norm, tf.float32)
+
+                if phase == "bid" and self.phase1:
+                    _, bid_logits, _ = self.model(states, training=True)
+                    bids_won = tf.convert_to_tensor(b["rewards"], tf.float32)
+                    ce = tf.reduce_mean(tf.keras.losses.sparse_categorical_crossentropy(
+                        bids_won, bid_logits, from_logits=True))
+                    total_bids_losses.append(ce)
+                    loss_value = self.phase_weight[phase] * ce
+                    total_loss = loss_value if total_loss is None else total_loss + loss_value
+                    continue
 
                 log_prob, value, entropy = self.evaluate_actions(states, masks, actions, phase)
 
@@ -170,7 +184,7 @@ class ActorCriticAgent:
                 loss_value = self.phase_weight[phase] * (
                     actor_loss + 0.5 * critic_loss - self.ent_coef * tf.reduce_mean(entropy))
 
-                total_actor_losses.append(float(actor_loss))
+                total_player_losses.append(float(actor_loss))
                 total_critic_losses.append(float(critic_loss))
                 total_loss = loss_value if total_loss is None else total_loss + loss_value
 
@@ -185,10 +199,15 @@ class ActorCriticAgent:
             print("Warning: skipped update (no data or non-finite loss)")
 
         mean = lambda x: np.mean(x) if len(x) else float("nan")
-        print(f"Actor losses: {mean(total_actor_losses)}, "
+        print(f"Player losses: {mean(total_player_losses)}, "
+              f"Bids losses: {mean(total_bids_losses)}, "
               f"critic losses: {mean(total_critic_losses)}, "
               f"bid reward: {mean(rewards['bid'])} (std {np.std(rewards['bid'])}), "
               f"play reward: {mean(rewards['play'])} (std {np.std(rewards['play'])})")
+        with open("training_data.txt", "ab") as f:
+            np.savetxt(f, [mean(total_player_losses), mean(total_bids_losses),
+                           mean(total_critic_losses)], fmt="%.5f", delimiter=' ', newline=', ')
+            f.write(b'\n')
         self.model.save_weights(self.checkpoint_path)
         self.epoch += 1
         self.memory_buffers.clear()
