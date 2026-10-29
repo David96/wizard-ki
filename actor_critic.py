@@ -23,6 +23,7 @@ class ActorCriticAgent:
         self.lr = 3e-4
         self.gamma = 0.99
         self.gae_λ = 0.95
+        self.clip_eps = 0.2
         self.max_grad_norm = 0.8
         self.ent_coef = 0.02
         self.phase_weight = {"play": 0.7, "bid": 0.3}
@@ -149,6 +150,7 @@ class ActorCriticAgent:
         total_player_losses = []
         total_bids_losses = []
         total_critic_losses = []
+        clip_fracs = []
 
         total_loss = None
         with tf.GradientTape() as tape:
@@ -171,15 +173,18 @@ class ActorCriticAgent:
                     total_loss = loss_value if total_loss is None else total_loss + loss_value
                     continue
 
+                old_logp = np.array(b["old_logp"], np.float32)
                 log_prob, value, entropy = self.evaluate_actions(states, masks, actions, phase)
 
                 # Sanity check: weights are unchanged since acting, so these must match.
-                if all(x is not None for x in b["old_logp"]):
-                    max_diff = float(tf.reduce_max(tf.abs(log_prob - np.array(b["old_logp"],
-                                                                              np.float32))))
-                    if max_diff > 1e-4:
-                        print(f"Warning: stored vs recomputed log_prob differ by {max_diff} ({phase})")
-                actor_loss = -tf.reduce_mean(log_prob * adv_norm)
+                max_diff = float(tf.reduce_max(tf.abs(log_prob - old_logp)))
+                if max_diff > 1e-4:
+                    print(f"Warning: stored vs recomputed log_prob differ by {max_diff} ({phase})")
+
+                # PPO clipped objective
+                ratio = tf.exp(log_prob - old_logp)
+                clipped = tf.clip_by_value(ratio, 1 - self.clip_eps, 1 + self.clip_eps)
+                actor_loss = -tf.reduce_mean(tf.minimum(ratio * adv_norm, clipped * adv_norm))
                 critic_loss = tf.reduce_mean(self.loss(ret[:, None], value[:, None]))
                 loss_value = self.phase_weight[phase] * (
                     actor_loss + 0.5 * critic_loss - self.ent_coef * tf.reduce_mean(entropy))
@@ -187,6 +192,8 @@ class ActorCriticAgent:
                 total_player_losses.append(float(actor_loss))
                 total_critic_losses.append(float(critic_loss))
                 total_loss = loss_value if total_loss is None else total_loss + loss_value
+                clip_fracs.append(float(tf.reduce_mean(
+                    tf.cast(tf.abs(ratio - 1) > self.clip_eps, tf.float32))))
 
         # ---- 3. Single update for the whole game ----
         if total_loss is not None and np.isfinite(float(total_loss)):
