@@ -91,9 +91,11 @@ class WizardEnv(WizardCallback):
     OFFSETS, OBS_DIM = _alloc([
         ("round", 1), ("phase", 2), ("players", 1),
         ("trump", 5), ("lead", 6), ("has_bid", 6), ("tricks_won", 6),
-        ("tricks_needed", 6), ("scores", 6), ("cards_to_play", 1),
+        ("tricks_needed", 6), ("scores", 6), ("cards_to_play", 1), ("n_following", 1),
         ("n_wizards", 1), ("n_fools", 1), ("n_trump", 1),
-        ("hand", NUM_CARDS), ("played", NUM_CARDS), ("table", NUM_CARDS), ("unseen", NUM_CARDS),
+        ("n_high_suits", 1), ("n_high_trump", 1),
+        ("hand", NUM_CARDS), ("legal_plays", NUM_CARDS), ("winning_plays", NUM_CARDS),
+        ("played", NUM_CARDS), ("table", NUM_CARDS), ("unseen", NUM_CARDS),
     ])
 
     def __init__(self, username, train, shared_agent : ActorCriticAgent,
@@ -119,12 +121,12 @@ class WizardEnv(WizardCallback):
 
     def play_game(self):
         self.correct_rounds = 0
-        self.bid_diffs = []
+        self.bids = []
+        self.tricks_won = []
         self.playing_reward = 0.0
         self.announcing_reward = 0.0
         self.players = None
         self.state = None
-        self.played = np.zeros(self.NUM_CARDS, dtype=bool)
         self.previous_players = None
         self.last_playing_state = self.last_playing_action = None
         self.last_announcing_state = self.last_announcing_action = None
@@ -187,13 +189,39 @@ class WizardEnv(WizardCallback):
     def _card_action_id(self, card):
         return card["id"]
 
+    def get_lead(self, table):
+        lead = None
+        i = 0
+        while (lead is None or lead["type"] == "fool") and i < len(table):
+            lead = table[i]
+            i += 1
+        return lead
+
+    def beats_card(self, c1, c2, trump):
+        """ Whether c1 is stronger than c2 """
+        if c2["type"] == "wizard" or c1["type"] == "fool":
+            return False
+        if c1["type"] == "wizard" or c2["type"] == "fool":
+            return True
+        # Both are numbers
+        return (c1["color"] == c2["color"] and c1["number"] > c2["number"]) or (
+            self.is_trump(c1, trump) and not self.is_trump(c2, trump)
+        )
+
+    def beats_table(self, card, table, trump):
+        lead = self.get_lead(table)
+        if not lead:
+            return True
+        highest_card = lead
+        for c in table:
+            if self.beats_card(c, highest_card, trump):
+                highest_card = c
+        return self.beats_card(card, highest_card, trump)
+
     def get_valid_playing_actions(self, state):
         legal = []
-        i = 0
-        lead = None
-        while (lead is None or lead["type"] == "fool") and i < len(state["table"]):
-            lead = state["table"][i]
-            i += 1
+        winning = []
+        lead = self.get_lead(state["table"])
         any_color = True
         if not lead is None and lead["type"] == "number":
             for card in state["hand"]:
@@ -207,7 +235,11 @@ class WizardEnv(WizardCallback):
                 legal.append(self._card_action_id(card))
             elif any_color or lead["color"] == card["color"]:
                 legal.append(self._card_action_id(card))
-        return legal
+            else:
+                continue
+            if self.beats_table(card, state["table"], state["trump"]):
+                winning.append(self._card_action_id(card))
+        return legal, winning
 
     def _card_for_action(self, hand, action):
         for card in hand:
@@ -218,13 +250,15 @@ class WizardEnv(WizardCallback):
     def on_turn(self, ws, state, players):
         enc_state = self.encode_state(state, players)
         is_bid = bool(state.get("announcing", False))
+        if is_bid:
+            self.played[:] = False
 
         # Commit the previous action of this same phase when its consequence is
         # observable. A phase boundary closes the previous phase's trajectory.
         if is_bid:
             self._finish_pending("play", None, True)
             if self.last_announcing_state is not None:
-                self._finish_pending("bid", enc_state, False)
+                self._finish_pending("bid", enc_state, True)
             legal = self.get_valid_announcing_actions(state, players)
             action, self.last_bidding_logp, self.last_bidding_value = self.agent.compute_action(
                 enc_state, legal, phase="bid")
@@ -234,7 +268,7 @@ class WizardEnv(WizardCallback):
         else:
             if self.last_playing_state is not None:
                 self._finish_pending("play", enc_state, False)
-            legal = self.get_valid_playing_actions(state)
+            legal, _ = self.get_valid_playing_actions(state)
             action, self.last_playing_logp, self.last_playing_value = self.agent.compute_action(
                 enc_state, legal, phase="play")
             card = self._card_for_action(state["hand"], action)
@@ -259,11 +293,12 @@ class WizardEnv(WizardCallback):
             _, me = self.get_player(self.players)
             print(f"Game finished with score {me["score"]}, "
                   f"correct bids: {self.correct_rounds}\n"
-                  f"\tbid_diffs: {self.bid_diffs}\n"
-                  f"\tavg: {np.mean(self.bid_diffs)}")
+                  f"\tbids: {self.bids}\n"
+                  f"\ttricks: {self.tricks_won}")
             with self.agent.lock:
                 with open("game_data.txt", "ab") as f:
-                    np.savetxt(f, self.bid_diffs, fmt="%.5f", delimiter=' ', newline=', ')
+                    np.savetxt(f, self.bids, fmt="%.5f", delimiter=' ', newline=', ')
+                    np.savetxt(f, self.tricks_won, fmt="%.5f", delimiter=' ', newline=', ')
                     f.write(b'\n')
             ws.close()
 
@@ -271,21 +306,14 @@ class WizardEnv(WizardCallback):
         if self.previous_players:
             _, old = self.get_player(self.previous_players)
             _, new = self.get_player(players)
-            if old.get("tricks") != new.get("tricks"):
-                # Dense, small shaping reward; exact round score is also
-                # assigned to the bid decision below.
-                self.playing_reward += -1.0 if new["tricks"] > new["announcement"] else 1.0
-                #if new["tricks"] == new["announcement"]:
-                #    self.playing_reward += 5.0
+            if new.get("tricks") > old.get("tricks"):
+                self.playing_reward += 1.0 # Train greedy, decorrelate from bidding
             if old.get("score") != new.get("score"):
-                score_diff = new["score"] - old["score"]
-                bid_diff = (score_diff - 20) / 10 if score_diff > 0 else score_diff / 10
-                # Higher rounds score higher, therefore normalize to the round number
-                self.announcing_reward += (score_diff) / 10 / self.state["round"]
-                # Don't penalize playing head to strongly in case of a bad bid
-                self.playing_reward += 5.0 if new["score"] > old["score"] else -5.0
+                # Reward for bidding equals tricks made, to train from cross entropy
+                self.announcing_reward += new["tricks"]
                 self.correct_rounds += 1 if new["score"] > old["score"] else 0
-                self.bid_diffs.append(bid_diff)
+                self.bids.append(new["announcement"])
+                self.tricks_won.append(new["tricks"])
         self.previous_players = [dict(p) for p in players]
         self.players = players
 
@@ -293,6 +321,11 @@ class WizardEnv(WizardCallback):
         # Websocket errors can be emitted for invalid moves; next decision is
         # selected randomly from legal moves and excluded from PPO training.
         print(f"{self.username}: server error: {message}")
+
+    def is_trump(self, card, trump) -> bool:
+        return (card["type"] == "number"
+            and not trump is None and "color" in trump
+            and card["color"] == trump["color"])
 
     def encode_state(self, state, players):
         encoded = np.zeros(self.OBS_DIM, dtype=np.float32)
@@ -324,6 +357,7 @@ class WizardEnv(WizardCallback):
             encoded[off["lead"] + self.stc(lead["color"])] = 1.0
 
         encoded[off["cards_to_play"]] = len(state["hand"]) / state["round"]
+        encoded[off["n_following"]] = len(players) - len(table) - 1
 
         # Rotate player features so slot 0 always represents the acting player.
         actor_index, _ = self.get_player(players)
@@ -340,9 +374,20 @@ class WizardEnv(WizardCallback):
         encoded_table =  self.encode_cards(table)
         encoded[off["n_wizards"]] = sum(c["type"] == "wizard" for c in state["hand"]) / 4
         encoded[off["n_fools"]] = sum(c["type"] == "fool" for c in state["hand"]) / 4
-        if lead and "color" in lead and state["hand"]:
-            encoded[off["n_trump"]] = sum("color" in c and c["color"] == lead["color"]
-                                         for c in state["hand"]) / len(state["hand"])
+        encoded[off["n_trump"]] = sum(self.is_trump(c, trump) for c in state["hand"]) / n_rounds
+        encoded[off["n_high_suits"]] = sum((
+                c["type"] == "number" and c["number"] >= 11 and not self.is_trump(c, trump)
+            ) for c in state["hand"]) / (4*3) # highest possible number
+        encoded[off["n_high_trump"]] = sum((
+                c["type"] == "number" and c["number"] >= 11 and self.is_trump(c, trump)
+            ) for c in state["hand"]) / 3 # highest possible number
+
+        if not state["announcing"]:
+            legal_actions, winning_actions = self.get_valid_playing_actions(state)
+            encoded[off["legal_plays"] + np.array(legal_actions)] = 1
+            if winning_actions:
+                encoded[off["winning_plays"] + np.array(winning_actions)] = 1
+
         encoded[off["hand"]:off["hand"] + self.NUM_CARDS] = encoded_hand
         encoded[off["table"]:off["table"] + self.NUM_CARDS] = encoded_table
 
@@ -356,21 +401,8 @@ class WizardEnv(WizardCallback):
 
     def encode_cards(self, cards):
         deck = np.zeros(self.NUM_CARDS, dtype=np.float32)
-        wizard_n = fool_n = 0
         for card in cards:
-            if not card:
-                continue
-            typ = card.get("type")
-            if typ == "number":
-                deck[13 * self.stc(card["color"]) + int(card["number"]) - 1] = 1.0
-            elif typ == "wizard":
-                if wizard_n < 4:
-                    deck[52 + wizard_n] = 1.0
-                    wizard_n += 1
-            elif typ == "fool":
-                if fool_n < 4:
-                    deck[56 + fool_n] = 1.0
-                    fool_n += 1
+            deck[self._card_action_id(card)] = 1.0
         return deck
 
     @staticmethod
