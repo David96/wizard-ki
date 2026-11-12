@@ -44,6 +44,10 @@ def main(num_players, num_games, train=True):
         for thread in threads:
             thread.join()
 
+        # Close any remaining decisions before the one shared optimizer update;
+        # otherwise events without a terminal done flag would be dropped.
+        for player in players:
+            player.train_agents()
         shared_agent.train()
         print(f"Finished game {game_idx + 1}/{num_games}")
 

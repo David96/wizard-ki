@@ -122,7 +122,7 @@ class ActorCriticAgent:
         tmp_batch = {p: {"state": [], "legal": [], "action": [], "adv": [],
                          "rewards": [], "ret": [], "old_logp": []} for p in ["bid", "play"]}
         batch = {"bid": {}, "play": {}}
-        for actor_history in self.memory_buffers.values():
+        for actor_id, actor_history in self.memory_buffers.items():
             for phase, data in actor_history.items():
                 b = tmp_batch[phase]
                 while data and any(e["done"] for e in data):
@@ -152,6 +152,9 @@ class ActorCriticAgent:
                         b["ret"].append(r)
                         b["rewards"].append(e["reward"])
                         b["old_logp"].append(e["log_prob"])
+                if data:
+                    print(f"Warning: dropping {len(data)} trailing {phase} "
+                          f"events of {actor_id} without a terminal done flag")
         for p, b in tmp_batch.items():
             adv = np.array(b["adv"])
             # Standardize advantages across the pooled batch, but only scale
