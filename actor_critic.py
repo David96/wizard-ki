@@ -14,6 +14,9 @@ eps = np.finfo(np.float32).eps.item()
 class ActorCriticAgent:
     NUM_PLAY_ACTIONS = 60
     NUM_BID_ACTIONS = 21
+    # Save a versioned checkpoint copy every N updates so a bad update can
+    # be rolled back without relying on manual copies.
+    CHECKPOINT_EVERY = 100
 
     def __init__(self, state_size: int, train: bool,
                  checkpoint_path: str = "training_actor_critic/shared_policy.weights.h5"):
@@ -273,4 +276,9 @@ class ActorCriticAgent:
             f.write(b'\n')
         self.model.save_weights(self.checkpoint_path)
         self.epoch += 1
+        if self.epoch % self.CHECKPOINT_EVERY == 0:
+            path = self.checkpoint_path.replace(
+                ".weights.h5", f"-auto-{self.epoch:06d}.weights.h5")
+            self.model.save_weights(path)
+            print(f"Saved versioned checkpoint {path}")
         self.memory_buffers.clear()
