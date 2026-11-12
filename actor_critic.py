@@ -80,7 +80,7 @@ class ActorCriticAgent:
         if self.train:
             action = int(tf.random.categorical(masked_logits[None, :], 1)[0, 0])
         else:
-            action = int(tf.math.margmax(masked_logits))
+            action = int(tf.argmax(masked_logits))
         log_prob = float(tf.nn.log_softmax(masked_logits)[action])
         return action, log_prob, float(value[0, 0])
 

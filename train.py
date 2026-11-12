@@ -56,8 +56,10 @@ def main(num_players, num_games, train=True):
 
 if __name__ == "__main__":
     if not 3 <= len(sys.argv) <= 4:
-        raise SystemExit("Usage: python train.py NUM_PLAYERS NUM_GAMES")
+        raise SystemExit("Usage: python train.py NUM_PLAYERS NUM_GAMES [TRAIN]")
     train = True
     if len(sys.argv) == 4:
-        train = bool(sys.argv[3])
+        # Only treat explicit truthy strings as training; bool("False") would
+        # silently enable training for every non-empty argument.
+        train = sys.argv[3].lower() in ("1", "true", "yes")
     main(int(sys.argv[1]), int(sys.argv[2]), train)
