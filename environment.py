@@ -300,17 +300,25 @@ class WizardEnv(WizardCallback):
                     np.savetxt(f, self.bids, fmt="%.5f", delimiter=' ', newline=', ')
                     np.savetxt(f, self.tricks_won, fmt="%.5f", delimiter=' ', newline=', ')
                     f.write(b'\n')
-            ws.close()
+            #ws.close()
 
     def on_player_update(self, ws, players):
         if self.previous_players:
             _, old = self.get_player(self.previous_players)
             _, new = self.get_player(players)
-            if new.get("tricks") > old.get("tricks"):
-                self.playing_reward += 1.0 # Train greedy, decorrelate from bidding
+            if new["tricks"] > old["tricks"]:
+                if self.agent.phase1:
+                    self.playing_reward += 1.0 # Train greedy, decorrelate from bidding
+                else:
+                    self.playing_reward += 1.0 if new["tricks"] <= new["announcement"] \
+                        else -1.0#max(-1.0, -1.0 * self.agent.epoch / 100)
             if old.get("score") != new.get("score"):
-                # Reward for bidding equals tricks made, to train from cross entropy
-                self.announcing_reward += new["tricks"]
+                # Phase 1: Reward for bidding equals tricks made, to train from cross entropy
+                # Phase 2: Use the actual score divided by some abitrary number
+                self.announcing_reward += new["tricks"] if self.agent.phase1 \
+                        else (new["score"] - old["score"]) / 10 / 5
+                if self.agent.phase1 and new["score"] > old["score"]:
+                    self.playing_reward += 2
                 self.correct_rounds += 1 if new["score"] > old["score"] else 0
                 self.bids.append(new["announcement"])
                 self.tricks_won.append(new["tricks"])

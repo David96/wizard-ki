@@ -11,17 +11,18 @@ from environment import WizardEnv
 from actor_critic import ActorCriticAgent
 
 
-def main(num_players, num_games):
+def main(num_players, num_games, train=True):
     state_size = WizardEnv.OBS_DIM
-    shared_agent = ActorCriticAgent(state_size)
+    print(f"Input state size: {state_size}")
+    shared_agent = ActorCriticAgent(state_size, train)
     shared_agent.load_weights()
 
-    n_games = 6
+    n_games = 1
     port = 6791
     players = []
-    for _ in range(n_games):
+    for k in range(n_games):
         players += [
-            WizardEnv(f"KI {i}", True, shared_agent,
+            WizardEnv(f"KI {i+k*num_players}", True, shared_agent,
                       websocket_url=f"ws://localhost:{port}")
             for i in range(num_players)
         ]
@@ -38,8 +39,8 @@ def main(num_players, num_games):
         # Keep the original server protocol: start after clients have joined.
         time.sleep(1.0)
         # The first player in a game is the game master, use them to start the game
-        for i in range(0, n_games * num_players, num_players):
-            players[i].send('{"action": "start_game"}')
+        #for i in range(0, n_games * num_players, num_players):
+        #    players[i].send('{"action": "start_game"}')
         for thread in threads:
             thread.join()
 
@@ -50,6 +51,9 @@ def main(num_players, num_games):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
+    if not 3 <= len(sys.argv) <= 4:
         raise SystemExit("Usage: python train.py NUM_PLAYERS NUM_GAMES")
-    main(int(sys.argv[1]), int(sys.argv[2]))
+    train = True
+    if len(sys.argv) == 4:
+        train = bool(sys.argv[3])
+    main(int(sys.argv[1]), int(sys.argv[2]), train)

@@ -15,15 +15,19 @@ class ActorCriticAgent:
     NUM_PLAY_ACTIONS = 60
     NUM_BID_ACTIONS = 21
 
-    def __init__(self, state_size: int,
+    def __init__(self, state_size: int, train: bool,
                  checkpoint_path: str = "training_actor_critic/shared_policy.weights.h5"):
+        self.train = train
         self.state_size = state_size
-        self.phase1 = True
+        self.phase1 = False
         self.lock = Lock()
         self.lr = 3e-4
         self.gamma = 0.99
         self.gae_λ = 0.95
         self.clip_eps = 0.2
+        self.ppo_epochs = 4
+        self.n_minibatches = 4
+        self.target_kl = 0.02
         self.max_grad_norm = 0.8
         self.ent_coef = 0.02
         self.phase_weight = {"play": 0.7, "bid": 0.3}
@@ -70,12 +74,17 @@ class ActorCriticAgent:
         masked_logits = tf.where(
             tf.convert_to_tensor(mask), logits[0],
             tf.cast(-1e9, logits.dtype))
-        action = int(tf.random.categorical(masked_logits[None, :], 1)[0, 0])
+        if self.train:
+            action = int(tf.random.categorical(masked_logits[None, :], 1)[0, 0])
+        else:
+            action = int(tf.math.margmax(masked_logits))
         log_prob = float(tf.nn.log_softmax(masked_logits)[action])
         return action, log_prob, float(value[0, 0])
 
     def store_episode(self, current_state, action, legal, reward, next_state, done,
                       phase, actor_id, log_prob, value):
+        if not self.train:
+            return
         with self.lock:
             if not actor_id in self.memory_buffers:
                 self.memory_buffers[actor_id] = {"bid": deque(), "play": deque()}
@@ -110,11 +119,12 @@ class ActorCriticAgent:
 
     def _create_batch(self, rewards):
         # Create batch for a single model update pass
-        batch = {phase: {"state": [], "legal": [], "action": [], "adv": [],
-                         "rewards": [], "ret": [], "old_logp": []}
-                     for phase in ("bid", "play")}
+        tmp_batch = {p: {"state": [], "legal": [], "action": [], "adv": [],
+                         "rewards": [], "ret": [], "old_logp": []} for p in ["bid", "play"]}
+        batch = {"bid": {}, "play": {}}
         for actor_history in self.memory_buffers.values():
             for phase, data in actor_history.items():
+                b = tmp_batch[phase]
                 while data and any(e["done"] for e in data):
                     # Events are stored in chronological order, so consume until "done"
                     events = []
@@ -134,7 +144,6 @@ class ActorCriticAgent:
                         returns.insert(0, discounted_sum)
 
                     adv, ret = self.compute_gae(events)
-                    b = batch[phase]
                     for e, a, r in zip(events, adv, ret):
                         b["state"].append(e["state"])
                         b["legal"].append(self._legal_mask(e["legal_actions"], phase))
@@ -143,72 +152,98 @@ class ActorCriticAgent:
                         b["ret"].append(r)
                         b["rewards"].append(e["reward"])
                         b["old_logp"].append(e["log_prob"])
+        for p, b in tmp_batch.items():
+            adv = np.array(b["adv"])
+            batch[p]["adv"] = tf.convert_to_tensor((adv - adv.mean()) / (adv.std() + eps),
+                                                   tf.float32)
+            batch[p]["rewards"] = tf.convert_to_tensor(b["rewards"], tf.float32)
+            batch[p]["legal"] = tf.convert_to_tensor(np.array(b["legal"], dtype=bool))
+            batch[p]["action"] = tf.convert_to_tensor(b["action"], tf.int32)
+            batch[p]["ret"] = tf.convert_to_tensor(b["ret"], tf.float32)
+            batch[p]["state"] = tf.convert_to_tensor(np.array(b["state"]), tf.float32)
+            batch[p]["old_logp"] = tf.convert_to_tensor(b["old_logp"], tf.float32)
         return batch
 
     def train(self):
+        if not self.train:
+            return
         rewards = {"bid": [], "play": []}
         total_player_losses = []
         total_bids_losses = []
         total_critic_losses = []
-        clip_fracs = []
+        approx_kls, clip_fracs = [], []
+        batch = self._create_batch(rewards)
+        for epoch in range(self.ppo_epochs):
+            splits = {p: np.array_split(np.random.permutation(len(x["action"])),
+                                        self.n_minibatches)
+                          for p, x in batch.items()}
+            epoch_kl = []
+            for k in range(self.n_minibatches):
+                total_loss = None
+                with tf.GradientTape() as tape:
+                    for phase, b in batch.items():
+                        idx = splits[phase][k]
+                        state = tf.gather(b["state"], idx)
+                        reward = tf.gather(b["rewards"], idx)
+                        legal = tf.gather(b["legal"], idx)
+                        action = tf.gather(b["action"], idx)
+                        old_logp = tf.gather(b["old_logp"], idx)
+                        adv = tf.gather(b["adv"], idx)
+                        ret = tf.gather(b["ret"], idx)
+                        # Train bid head from the cross entropy to actual bids won
+                        if phase == "bid" and self.phase1:
+                            _, bid_logits, _ = self.model(state, training=True)
+                            ce = tf.reduce_mean(tf.keras.losses.sparse_categorical_crossentropy(
+                                reward, bid_logits, from_logits=True))
+                            total_bids_losses.append(ce)
+                            loss_value = self.phase_weight[phase] * ce
+                            total_loss = loss_value if total_loss is None else total_loss + loss_value
+                            continue
 
-        total_loss = None
-        with tf.GradientTape() as tape:
-            for phase, b in self._create_batch(rewards).items():
-                states = tf.convert_to_tensor(np.array(b["state"]), tf.float32)
-                masks = tf.convert_to_tensor(np.array(b["legal"], dtype=bool))
-                actions = tf.convert_to_tensor(b["action"], tf.int32)
-                ret = tf.convert_to_tensor(b["ret"], tf.float32)
-                adv = np.array(b["adv"], np.float32)
-                adv_norm = (adv - adv.mean()) / (adv.std() + eps)
-                adv_norm = tf.convert_to_tensor(adv_norm, tf.float32)
+                        log_prob, value, entropy = self.evaluate_actions(state, legal,
+                                                                         action, phase)
 
-                if phase == "bid" and self.phase1:
-                    _, bid_logits, _ = self.model(states, training=True)
-                    bids_won = tf.convert_to_tensor(b["rewards"], tf.float32)
-                    ce = tf.reduce_mean(tf.keras.losses.sparse_categorical_crossentropy(
-                        bids_won, bid_logits, from_logits=True))
-                    total_bids_losses.append(ce)
-                    loss_value = self.phase_weight[phase] * ce
-                    total_loss = loss_value if total_loss is None else total_loss + loss_value
-                    continue
+                        if epoch == 0 and k == 0:
+                            # Sanity check: weights are unchanged since acting,
+                            # so these must match.
+                            max_diff = float(tf.reduce_max(tf.abs(log_prob - old_logp)))
+                            if max_diff > 1e-4:
+                                print(f"Warning: stored vs recomputed log_prob differ by {max_diff} ({phase})")
 
-                old_logp = np.array(b["old_logp"], np.float32)
-                log_prob, value, entropy = self.evaluate_actions(states, masks, actions, phase)
+                        # PPO clipped objective
+                        ratio = tf.exp(log_prob - old_logp)
+                        clipped = tf.clip_by_value(ratio, 1 - self.clip_eps, 1 + self.clip_eps)
+                        actor_loss = -tf.reduce_mean(tf.minimum(ratio * adv, clipped *
+                                                                adv))
+                        critic_loss = tf.reduce_mean(self.loss(ret[:, None], value[:, None]))
+                        loss_value = self.phase_weight[phase] * (
+                            actor_loss + 0.5 * critic_loss - self.ent_coef * tf.reduce_mean(entropy))
 
-                # Sanity check: weights are unchanged since acting, so these must match.
-                max_diff = float(tf.reduce_max(tf.abs(log_prob - old_logp)))
-                if max_diff > 1e-4:
-                    print(f"Warning: stored vs recomputed log_prob differ by {max_diff} ({phase})")
+                        total_player_losses.append(float(actor_loss))
+                        total_critic_losses.append(float(critic_loss))
+                        total_loss = loss_value if total_loss is None else total_loss + loss_value
+                        epoch_kl.append(float(tf.reduce_mean(old_logp - log_prob)))
+                        clip_fracs.append(float(tf.reduce_mean(
+                            tf.cast(tf.abs(ratio - 1) > self.clip_eps, tf.float32))))
 
-                # PPO clipped objective
-                ratio = tf.exp(log_prob - old_logp)
-                clipped = tf.clip_by_value(ratio, 1 - self.clip_eps, 1 + self.clip_eps)
-                actor_loss = -tf.reduce_mean(tf.minimum(ratio * adv_norm, clipped * adv_norm))
-                critic_loss = tf.reduce_mean(self.loss(ret[:, None], value[:, None]))
-                loss_value = self.phase_weight[phase] * (
-                    actor_loss + 0.5 * critic_loss - self.ent_coef * tf.reduce_mean(entropy))
-
-                total_player_losses.append(float(actor_loss))
-                total_critic_losses.append(float(critic_loss))
-                total_loss = loss_value if total_loss is None else total_loss + loss_value
-                clip_fracs.append(float(tf.reduce_mean(
-                    tf.cast(tf.abs(ratio - 1) > self.clip_eps, tf.float32))))
-
-        # ---- 3. Single update for the whole game ----
-        if total_loss is not None and np.isfinite(float(total_loss)):
-            variables = self.model.trainable_variables
-            grads = tape.gradient(total_loss, variables)
-            pairs = [(g, v) for g, v in zip(grads, variables) if g is not None]
-            clipped, _ = tf.clip_by_global_norm([g for g, _ in pairs], self.max_grad_norm)
-            self.optimizer.apply_gradients(zip(clipped, [v for _, v in pairs]))
-        else:
-            print("Warning: skipped update (no data or non-finite loss)")
+                # ---- 3. Single update for the whole game ----
+                if total_loss is not None and np.isfinite(float(total_loss)):
+                    variables = self.model.trainable_variables
+                    grads = tape.gradient(total_loss, variables)
+                    pairs = [(g, v) for g, v in zip(grads, variables) if g is not None]
+                    clipped, _ = tf.clip_by_global_norm([g for g, _ in pairs], self.max_grad_norm)
+                    self.optimizer.apply_gradients(zip(clipped, [v for _, v in pairs]))
+                else:
+                    print("Warning: skipped update (no data or non-finite loss)")
+            approx_kls.append(np.mean(epoch_kl) if epoch_kl else 0.0)
+            if approx_kls[-1] > 1.5 * self.target_kl:   # policy already moved enough
+                break
 
         mean = lambda x: np.mean(x) if len(x) else float("nan")
         print(f"Player losses: {mean(total_player_losses)}, "
               f"Bids losses: {mean(total_bids_losses)}, "
               f"critic losses: {mean(total_critic_losses)}, "
+              f"approx KL: {mean(approx_kls)}, clip frac: {mean(clip_fracs)}, "
               f"bid reward: {mean(rewards['bid'])} (std {np.std(rewards['bid'])}), "
               f"play reward: {mean(rewards['play'])} (std {np.std(rewards['play'])})")
         with open("training_data.txt", "ab") as f:
