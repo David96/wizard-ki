@@ -8,7 +8,6 @@ import sys
 import traceback
 
 from actor_critic import ActorCriticAgent
-from q_agent import QAgent
 
 
 class WizardCallback:
@@ -19,10 +18,42 @@ class WizardCallback:
     def on_choosing_trump(self, ws, state, players): pass
 
 
+class RoomGroup:
+    """Coordinates the server room of one pooled game.
+
+    The client with create_room=True requests a room from the server and
+    publishes the room id together with a round counter (one round per
+    play_game() call); the other clients of the same game wait for the id of
+    the current round. Round-tagged publishing makes the handoff safe across
+    consecutive games without resetting shared state.
+    """
+
+    def __init__(self):
+        self._cond = threading.Condition()
+        self.round = -1
+        self.room_id = None
+
+    def publish(self, round, room_id):
+        with self._cond:
+            self.round = round
+            self.room_id = room_id
+            self._cond.notify_all()
+
+    def wait_for(self, round, timeout=30.0):
+        with self._cond:
+            if self.round < round:
+                self._cond.wait_for(lambda: self.round >= round, timeout=timeout)
+            return self.room_id if self.round >= round else None
+
+
 class WizardGame:
-    def __init__(self, username, callback, url="ws://localhost:6791"):
+    def __init__(self, username, callback, url="ws://localhost:6791",
+                 room_group=None, create_room=False, room_round=0):
         self.username = username
         self.callback = callback
+        self.room_group = room_group
+        self.create_room = create_room
+        self.room_round = room_round
         self.players = None
         self.state = None
         self.ws_app = websocket.WebSocketApp(
@@ -37,6 +68,9 @@ class WizardGame:
         kind = data.get("type")
         if kind == "joined":
             print(f"{self.username}: joined game")
+            room_id = data.get("room_id")
+            if self.create_room and self.room_group is not None and room_id:
+                self.room_group.publish(self.room_round, room_id)
         elif kind == "state":
             self.state = data
             self.callback.on_state_update(ws, data)
@@ -49,6 +83,12 @@ class WizardGame:
                 self.callback.on_turn(ws, self.state, self.players)
         elif kind == "error":
             self.callback.on_error(ws, data.get("msg", "unknown server error"))
+            if (self.create_room and self.room_group is not None
+                    and self.room_group.round < self.room_round):
+                # Room creation failed (e.g. too many rooms): unblock the
+                # waiting joiners with no id and end this connection.
+                self.room_group.publish(self.room_round, None)
+                ws.close()
             if self.get_turn() and self.state and self.state.get("choosing_trump") is None:
                 self.callback.on_turn(ws, self.state, self.players or [])
 
@@ -59,7 +99,21 @@ class WizardGame:
     def on_close(self, ws, *args): pass
 
     def on_open(self, ws):
-        ws.send(json.dumps({"action": "join", "name": self.username}))
+        if self.create_room:
+            # The server creates the room, joins us as its first user (and
+            # creator) and sends the room id back with the "joined" message.
+            ws.send(json.dumps({"action": "create_room", "name": self.username}))
+        elif self.room_group is not None:
+            room_id = self.room_group.wait_for(self.room_round)
+            if room_id is None:
+                print(f"{self.username}: no room id available, closing")
+                ws.close()
+                return
+            ws.send(json.dumps({"action": "join", "name": self.username,
+                                "room": room_id}))
+        else:
+            # Legacy protocol of the old room-less server version.
+            ws.send(json.dumps({"action": "join", "name": self.username}))
 
     def send(self, msg):
         self.ws_app.send(msg)
@@ -100,11 +154,18 @@ class WizardEnv(WizardCallback):
     ])
 
     def __init__(self, username, train, shared_agent : ActorCriticAgent,
-                 websocket_url="ws://localhost:6791"):
+                 websocket_url="ws://localhost:6791",
+                 room_group=None, create_room=False):
         self.username = username
         self.train = bool(train)
         self.agent = shared_agent
         self.websocket_url = websocket_url
+        # Room coordination against the room-based server: the first client
+        # of a pooled game creates the room, the others join it. room_round
+        # counts the play_game() calls to keep rounds in sync across threads.
+        self.room_group = room_group
+        self.create_room = create_room
+        self.room_round = 0
         self.players = None
         self.state = None
         self.played = np.zeros(self.NUM_CARDS, dtype=bool)
@@ -132,7 +193,11 @@ class WizardEnv(WizardCallback):
         self.last_playing_state = self.last_playing_action = None
         self.last_announcing_state = self.last_announcing_action = None
         self.last_playing_legal = self.last_announcing_legal = None
-        self.game = WizardGame(self.username, self, self.websocket_url)
+        self.game = WizardGame(self.username, self, self.websocket_url,
+                               room_group=self.room_group,
+                               create_room=self.create_room,
+                               room_round=self.room_round)
+        self.room_round += 1
         self.game.start()
 
     def send(self, msg):
@@ -327,7 +392,10 @@ class WizardEnv(WizardCallback):
                             f"{len(self.players or [])}, "
                             f"{int(self.agent.phase1)}, {int(self.train)}, "
                             f"{self.agent.epoch}\n".encode())
-            #ws.close()
+            # The room-based server keeps connections open after game_over;
+            # close here so play_game() returns between training iterations
+            # and the empty room is cleaned up server-side.
+            ws.close()
 
     def on_player_update(self, ws, players):
         if self.previous_players:
