@@ -17,7 +17,7 @@ def main(num_players, num_games, train=True):
     shared_agent = ActorCriticAgent(state_size, train)
     shared_agent.load_weights()
 
-    n_games = 1
+    n_games = 6
     port = 6791
     players = []
     for k in range(n_games):
@@ -39,8 +39,8 @@ def main(num_players, num_games, train=True):
         # Keep the original server protocol: start after clients have joined.
         time.sleep(1.0)
         # The first player in a game is the game master, use them to start the game
-        #for i in range(0, n_games * num_players, num_players):
-        #    players[i].send('{"action": "start_game"}')
+        for i in range(0, n_games * num_players, num_players):
+            players[i].send('{"action": "start_game"}')
         for thread in threads:
             thread.join()
 
