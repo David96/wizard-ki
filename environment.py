@@ -319,6 +319,14 @@ class WizardEnv(WizardCallback):
                         else (new["score"] - old["score"]) / 10 / 5
                 if self.agent.phase1 and new["score"] > old["score"]:
                     self.playing_reward += 2
+                elif not self.agent.phase1:
+                    # Phase 2: also credit the round outcome to the play
+                    # stream. The delta lands on the round's last pending play
+                    # action; since the round is a closed GAE segment, it acts
+                    # as terminal reward and propagates back through all play
+                    # decisions of the round, so skillful dumping pays off
+                    # instead of silently earning nothing.
+                    self.playing_reward += (new["score"] - old["score"]) / 10 / 5
                 self.correct_rounds += 1 if new["score"] > old["score"] else 0
                 self.bids.append(new["announcement"])
                 self.tricks_won.append(new["tricks"])
