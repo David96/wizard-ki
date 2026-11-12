@@ -260,6 +260,17 @@ class ActorCriticAgent:
             np.savetxt(f, [mean(total_player_losses), mean(total_bids_losses),
                            mean(total_critic_losses)], fmt="%.5f", delimiter=' ', newline=', ')
             f.write(b'\n')
+        # Health metrics per update in a separate file, so the legacy
+        # 3-column training_data.txt stays parseable by existing notebooks.
+        # Columns: update (1-based), player loss, critic loss, approx KL,
+        # clip fraction, mean bid reward, mean play reward.
+        with open("training_metrics.txt", "ab") as f:
+            np.savetxt(f, [self.epoch + 1, mean(total_player_losses),
+                            mean(total_critic_losses), mean(approx_kls),
+                            mean(clip_fracs), mean(rewards["bid"]),
+                            mean(rewards["play"])],
+                       fmt="%.5f", delimiter=' ', newline=', ')
+            f.write(b'\n')
         self.model.save_weights(self.checkpoint_path)
         self.epoch += 1
         self.memory_buffers.clear()
