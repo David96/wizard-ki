@@ -20,7 +20,9 @@ class ActorCriticAgent:
 
     def __init__(self, state_size: int, train: bool,
                  checkpoint_path: str = "training_actor_critic/shared_policy.weights.h5"):
-        self.train = train
+        # Named self.training: a self.train attribute would shadow the
+        # train() method, making shared_agent.train() raise TypeError.
+        self.training = bool(train)
         self.state_size = state_size
         self.phase1 = False
         self.lock = Lock()
@@ -77,7 +79,7 @@ class ActorCriticAgent:
         masked_logits = tf.where(
             tf.convert_to_tensor(mask), logits[0],
             tf.cast(-1e9, logits.dtype))
-        if self.train:
+        if self.training:
             action = int(tf.random.categorical(masked_logits[None, :], 1)[0, 0])
         else:
             action = int(tf.argmax(masked_logits))
@@ -86,7 +88,7 @@ class ActorCriticAgent:
 
     def store_episode(self, current_state, action, legal, reward, next_state, done,
                       phase, actor_id, log_prob, value):
-        if not self.train:
+        if not self.training:
             return
         with self.lock:
             if not actor_id in self.memory_buffers:
@@ -178,7 +180,7 @@ class ActorCriticAgent:
         return batch
 
     def train(self):
-        if not self.train:
+        if not self.training:
             return
         rewards = {"bid": [], "play": []}
         total_player_losses = []
