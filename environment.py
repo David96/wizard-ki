@@ -277,10 +277,27 @@ class WizardEnv(WizardCallback):
             self.last_playing_legal = legal
 
     def on_choosing_trump(self, ws, state, players):
-        # Keep this deterministic baseline behavior; trump choice is not yet an
-        # action head. It can be added as a third head if the server exposes it.
+        # Trump choice is not learned; use a simple heuristic instead of the
+        # old fixed "red". A learned third policy head remains a future option.
         if state.get("choosing_trump") == self.username:
-            ws.send(json.dumps({"action": "choose_trump", "color": "red"}))
+            ws.send(json.dumps({"action": "choose_trump",
+                                "color": self._choose_trump_color(state)}))
+
+    @staticmethod
+    def _choose_trump_color(state):
+        """Pick the color with the most high (>= 11) number cards in hand;
+        ties are broken by how many number cards we hold of that color.
+        Falls back to "red" if nothing is visible (round 1 hides the hand)."""
+        hand = state.get("hand") or []
+
+        def strength(color):
+            numbers = [c for c in hand
+                       if c.get("type") == "number" and c.get("color") == color]
+            return (sum(c["number"] >= 11 for c in numbers), len(numbers))
+
+        colors = ["red", "blue", "green", "yellow"]
+        best = max(colors, key=strength)
+        return best if strength(best) != (0, 0) else "red"
 
     def on_state_update(self, ws, state):
         self.state = state
