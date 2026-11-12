@@ -1,14 +1,14 @@
 """Run shared-policy self-play against the local Wizard websocket server.
 
 Usage: python train.py NUM_PLAYERS NUM_GAMES [TRAIN [N_GAMES [FROZEN_CHECKPOINT]]]
-The game server must be running on ws://localhost:6791 (+ one instance per
-extra pooled game, see N_GAMES).
+The game server must be running on ws://localhost:6791. Each pooled game
+creates its own room on the server (which supports up to 20 at a time).
 """
 import sys
 import time
 from threading import Thread
 
-from environment import WizardEnv
+from environment import WizardEnv, RoomGroup
 from actor_critic import ActorCriticAgent
 
 
@@ -29,16 +29,18 @@ def main(num_players, num_games, train=True, pooled_games=6,
         frozen_agent.load_weights()
         print(f"Frozen opponent on one seat per game: {frozen_checkpoint}")
 
-    port = 6791
     players = []
     for k in range(pooled_games):
+        # One room per pooled game: the first client creates it (and becomes
+        # the room creator, i.e. the one allowed to send start_game), the
+        # others wait for the published room id and join.
+        group = RoomGroup()
         for i in range(num_players):
             use_frozen = frozen_agent is not None and i == num_players - 1
             players.append(WizardEnv(
                 f"KI {i+k*num_players}", train and not use_frozen,
                 frozen_agent if use_frozen else shared_agent,
-                websocket_url=f"ws://localhost:{port}"))
-        port += 1
+                room_group=group, create_room=(i == 0), close_delay=i))
 
     for game_idx in range(num_games):
         threads = []
@@ -48,9 +50,10 @@ def main(num_players, num_games, train=True, pooled_games=6,
             threads.append(thread)
             time.sleep(0.1)
 
-        # Keep the original server protocol: start after clients have joined.
+        # Give every client time to join its room, then start all pooled
+        # games. The first player of each game is the room creator and the
+        # only one the server lets send start_game.
         time.sleep(1.0)
-        # The first player in a game is the game master, use them to start the game
         for i in range(0, pooled_games * num_players, num_players):
             players[i].send('{"action": "start_game"}')
         for thread in threads:

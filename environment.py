@@ -155,7 +155,7 @@ class WizardEnv(WizardCallback):
 
     def __init__(self, username, train, shared_agent : ActorCriticAgent,
                  websocket_url="ws://localhost:6791",
-                 room_group=None, create_room=False):
+                 room_group=None, create_room=False, close_delay=0.0):
         self.username = username
         self.train = bool(train)
         self.agent = shared_agent
@@ -166,6 +166,7 @@ class WizardEnv(WizardCallback):
         self.room_group = room_group
         self.create_room = create_room
         self.room_round = 0
+        self.close_delay = close_delay
         self.players = None
         self.state = None
         self.played = np.zeros(self.NUM_CARDS, dtype=bool)
@@ -394,7 +395,13 @@ class WizardEnv(WizardCallback):
                             f"{self.agent.epoch}\n".encode())
             # The room-based server keeps connections open after game_over;
             # close here so play_game() returns between training iterations
-            # and the empty room is cleaned up server-side.
+            # and the empty room is cleaned up server-side. Stagger the
+            # disconnects per seat: game_room.py reassigns creator rights by
+            # sending to remaining users while they leave, and hitting an
+            # already-closed socket raises, which makes the room leak
+            # (the server only allows 20 rooms).
+            if self.close_delay:
+                time.sleep(self.close_delay)
             ws.close()
 
     def on_player_update(self, ws, players):
