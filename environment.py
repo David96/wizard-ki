@@ -1,6 +1,7 @@
 """Wizard websocket environment with fixed-card observations and shared PPO."""
 import json
 import threading
+import time
 import websocket
 import numpy as np
 import sys
@@ -317,6 +318,15 @@ class WizardEnv(WizardCallback):
                     np.savetxt(f, self.bids, fmt="%.5f", delimiter=' ', newline=', ')
                     np.savetxt(f, self.tricks_won, fmt="%.5f", delimiter=' ', newline=', ')
                     f.write(b'\n')
+                # One metadata line per game_data.txt line, so self-play,
+                # human-vs-AI games, phase changes and eval runs can be told
+                # apart later. Columns: unix timestamp, username, player count,
+                # phase1 flag, train flag, agent update counter.
+                with open("game_meta.txt", "ab") as f:
+                    f.write(f"{time.time():.0f}, {self.username}, "
+                            f"{len(self.players or [])}, "
+                            f"{int(self.agent.phase1)}, {int(self.train)}, "
+                            f"{self.agent.epoch}\n".encode())
             #ws.close()
 
     def on_player_update(self, ws, players):
