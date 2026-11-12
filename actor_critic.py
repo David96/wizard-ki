@@ -24,7 +24,14 @@ class ActorCriticAgent:
         self.state_size = state_size
         self.phase1 = False
         self.lock = Lock()
-        self.lr = 3e-4
+        # Anneal step size and exploration for late-stage consolidation.
+        # Linear decay over the first anneal_updates updates. NOTE: self.epoch
+        # counts updates of the current process only (it is not persisted), so
+        # the schedule restarts with every train.py invocation.
+        self.lr_start, self.lr_end = 3e-4, 1e-4
+        self.ent_start, self.ent_end = 0.02, 0.005
+        self.anneal_updates = 10_000
+        self.lr = self.lr_start
         self.gamma = 0.99
         self.gae_λ = 0.95
         self.clip_eps = 0.2
@@ -32,7 +39,7 @@ class ActorCriticAgent:
         self.n_minibatches = 4
         self.target_kl = 0.02
         self.max_grad_norm = 0.8
-        self.ent_coef = 0.02
+        self.ent_coef = self.ent_start
         self.phase_weight = {"play": 0.7, "bid": 0.3}
         self.epoch = 0
         self.memory_buffers = {}
@@ -177,9 +184,18 @@ class ActorCriticAgent:
             batch[p]["old_logp"] = tf.convert_to_tensor(b["old_logp"], tf.float32)
         return batch
 
+    def _anneal_hyperparams(self):
+        """Linearly decay learning rate and entropy bonus over the first
+        self.anneal_updates updates to consolidate late-stage training."""
+        t = min(self.epoch / self.anneal_updates, 1.0)
+        self.optimizer.learning_rate.assign(
+            self.lr_start + (self.lr_end - self.lr_start) * t)
+        self.ent_coef = self.ent_start + (self.ent_end - self.ent_start) * t
+
     def train(self):
         if not self.train:
             return
+        self._anneal_hyperparams()
         rewards = {"bid": [], "play": []}
         total_player_losses = []
         total_bids_losses = []
