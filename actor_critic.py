@@ -154,8 +154,15 @@ class ActorCriticAgent:
                         b["old_logp"].append(e["log_prob"])
         for p, b in tmp_batch.items():
             adv = np.array(b["adv"])
-            batch[p]["adv"] = tf.convert_to_tensor((adv - adv.mean()) / (adv.std() + eps),
-                                                   tf.float32)
+            # Standardize advantages across the pooled batch, but only scale
+            # when the spread is meaningful. Near-constant batches (e.g. a
+            # phase with no trick rewards) would otherwise be normalized into
+            # pure noise.
+            if adv.size and adv.std() > 1e-3:
+                adv = (adv - adv.mean()) / (adv.std() + eps)
+            elif adv.size:
+                adv = adv - adv.mean()
+            batch[p]["adv"] = tf.convert_to_tensor(adv, tf.float32)
             batch[p]["rewards"] = tf.convert_to_tensor(b["rewards"], tf.float32)
             batch[p]["legal"] = tf.convert_to_tensor(np.array(b["legal"], dtype=bool))
             batch[p]["action"] = tf.convert_to_tensor(b["action"], tf.int32)
