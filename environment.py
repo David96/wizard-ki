@@ -155,7 +155,8 @@ class WizardEnv(WizardCallback):
 
     def __init__(self, username, train, shared_agent : ActorCriticAgent,
                  websocket_url="ws://localhost:6791",
-                 room_group=None, create_room=False, close_delay=0.0):
+                 room_group=None, create_room=False, close_delay=0.0, think_delay=0.):
+        self.think_delay = think_delay
         self.username = username
         self.train = bool(train)
         self.agent = shared_agent
@@ -315,6 +316,8 @@ class WizardEnv(WizardCallback):
         raise ValueError(f"Chosen action {action} does not map to current hand")
 
     def on_turn(self, ws, state, players):
+        if self.think_delay > 0:
+            time.sleep(self.think_delay)
         enc_state = self.encode_state(state, players)
         is_bid = bool(state.get("announcing", False))
         if is_bid:
